@@ -1,0 +1,303 @@
+package in.smitapriya.billingsoftware.service.impl;
+
+import in.smitapriya.billingsoftware.entity.OrderEntity;
+import in.smitapriya.billingsoftware.entity.OrderItemEntity;
+import in.smitapriya.billingsoftware.io.*;
+import in.smitapriya.billingsoftware.repository.OrderEntityRepository;
+import in.smitapriya.billingsoftware.service.OrderService;
+import in.smitapriya.billingsoftware.specification.OrderSpecification;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.web.client.RestTemplate;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.*;
+
+import org.springframework.data.domain.Pageable;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.stream.Collectors;
+@RequiredArgsConstructor
+@Service
+public class OrderServiceImpl implements OrderService {
+    private final OrderEntityRepository orderEntityRepository;
+    @Value("${gemini.api.key}")
+    private String geminiApiKey;
+    @Value("${gemini.api.url}")
+    private String geminiApiUrl;
+
+    // new order banata h, request ko entity me convert karke DB me save karta hai aur response return karta hai
+    @Override
+    public OrderResponse createOrder(OrderRequest request) {
+       OrderEntity newOrder= convertToOrderEntity(request);
+
+        PaymentDetails paymentDetails=new PaymentDetails();
+        paymentDetails.setStatus(newOrder.getPaymentMethod() == PaymentMethod.CASH
+                ? PaymentDetails.PaymentStatus.COMPLETED : PaymentDetails.PaymentStatus.PENDING);
+        newOrder.setPaymentDetails(paymentDetails);
+
+        // Request ke cartItems ko OrderItemEntity list me convert karke newOrder me set kar raha hai
+        List<OrderItemEntity> orderItems=request.getCartItems().stream()
+                .map(this::convertToOrderItemEntity)
+                .collect(Collectors.toList());
+        newOrder.setItems(orderItems);
+
+        newOrder=orderEntityRepository.save(newOrder);
+        return convertToResponse(newOrder);
+    }
+
+    // OrderRequest ko OrderEntity me convert karta hai (DB save ke liye)
+    private OrderEntity convertToOrderEntity(OrderRequest request) {
+       return OrderEntity.builder()
+                .customerName(request.getCustomerName())
+                .phoneNumber(request.getPhoneNumber())
+                .subtotal(request.getSubtotal())
+                .tax(request.getTax())
+                .grandTotal(request.getGrandTotal())
+                .paymentMethod(PaymentMethod.valueOf(request.getPaymentMethod()))
+                .build();
+    }
+    // OrderEntity ko OrderResponse me convert karta hai (client ko bhejne ke liye)
+    private OrderResponse convertToResponse(OrderEntity newOrder) {
+        return OrderResponse.builder()
+                .orderId(newOrder.getOrderId())
+                .customerName(newOrder.getCustomerName())
+                .phoneNumber(newOrder.getPhoneNumber())
+                .subtotal(newOrder.getSubtotal())
+                .tax(newOrder.getTax())
+                .grandTotal(newOrder.getGrandTotal())
+                .paymentMethod(newOrder.getPaymentMethod())
+                // OrderEntity ke items ko OrderResponse ke items me convert karke list banata hai aur response object me set karta hai.
+                .items(newOrder.getItems().stream()
+                        .map(this::convertToItemResponse)
+                        .collect(Collectors.toList()))
+                .paymentDetails(newOrder.getPaymentDetails())
+                .createdAt(newOrder.getCreatedAt())
+                .build();
+    }
+    // OrderItemEntity ko OrderItemResponse me convert karta hai
+    private OrderResponse.OrderItemResponse convertToItemResponse(OrderItemEntity orderItemEntity) {
+        return OrderResponse.OrderItemResponse.builder()
+                .itemId(orderItemEntity.getItemId())
+                .name(orderItemEntity.getName())
+                .price(orderItemEntity.getPrice())
+                .quantity(orderItemEntity.getQuantity())
+                .build();
+
+    }
+    // OrderItemRequest ko OrderItemEntity me convert karta hai
+    private OrderItemEntity convertToOrderItemEntity(OrderRequest.OrderItemRequest orderItemRequest) {
+      return OrderItemEntity.builder()
+               .itemId(orderItemRequest.getItemId())
+               .name(orderItemRequest.getName())
+               .price(orderItemRequest.getPrice())
+               .quantity(orderItemRequest.getQuantity())
+               .build();
+    }
+
+    @Override
+    public void deleteOrder(String orderId) {
+       OrderEntity existingOrder= orderEntityRepository.findByOrderId(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found"));
+       orderEntityRepository.delete(existingOrder);
+
+    }
+
+//    @Override
+//    public Page<OrderResponse> getOrders(Pageable pageable, String searchByItemName) {
+//       if(searchByItemName == null){
+//           return orderEntityRepository.findAll(pageable)
+//                   .map(this::convertToResponse);
+//       }
+//       else{
+////        return orderEntityRepository.findByCustomerNameContainingIgnoreCase(searchByCustomerName, pageable).map(this::convertToResponse);
+////
+//           return orderEntityRepository.findByItemName(searchByItemName, pageable).map(this::convertToResponse);
+//
+//       }
+//
+//
+//    }
+
+
+    @Override
+    public String summarizeOrders() {
+
+        List<OrderEntity> orders = orderEntityRepository.findAllByOrderByCreatedAtDesc();
+
+        try {
+
+            // Simplify Orders
+            List<Map<String, Object>> simplifiedOrders = orders.stream().map(order -> {
+
+                Map<String, Object> map = new HashMap<>();
+                map.put("orderId", order.getOrderId());
+                map.put("customerName", order.getCustomerName());
+                map.put("grandTotal", order.getGrandTotal());
+                map.put("paymentMethod", order.getPaymentMethod());
+
+                map.put("items", order.getItems().stream().map(item -> {
+
+                    Map<String, Object> itemMap = new HashMap<>();
+                    itemMap.put("name", item.getName());
+                    itemMap.put("price", item.getPrice());
+                    itemMap.put("quantity", item.getQuantity());
+
+                    return itemMap;
+
+                }).toList());
+
+                return map;
+
+            }).toList();
+
+            ObjectMapper mapper = new ObjectMapper();
+            String ordersJson = mapper.writeValueAsString(simplifiedOrders);
+
+            // Build Prompt
+//            String prompt = """
+//                You are a business analyst.
+//                Analyze the following order data and provide:
+//                - Total revenue
+//                - Most sold products
+//                - Payment method distribution
+//                - Business insights
+//                - Suggestions for growth
+//
+//                Orders Data:
+//                """ + ordersJson;
+            String prompt = """
+Analyze the following order data and provide a clean business summary.
+
+IMPORTANT RULES:
+- Respond in plain text only.
+- Do NOT use markdown symbols like ###, **, ---, *, or tables.
+- Do NOT repeat sections.
+- Use simple headings and bullet points using hyphen (-) only.
+- Keep response clear and structured.
+- Avoid duplicate text.
+- Keep the summary under 300 words.
+
+Order Data:
+""" + ordersJson;
+
+
+            return callGemini(prompt);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw new RuntimeException("Error generating summary: " + e.getMessage());
+        }
+    }
+
+
+
+    private String callGemini(String prompt) {
+
+        RestTemplate restTemplate = new RestTemplate();
+        String url = geminiApiUrl;
+
+        Map<String, Object> textPart = new HashMap<>();
+        textPart.put("text", prompt);
+
+        Map<String, Object> content = new HashMap<>();
+        content.put("parts", List.of(textPart));
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("contents", List.of(content));
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-goog-api-key", geminiApiKey);
+
+        HttpEntity<Map<String, Object>> request =
+                new HttpEntity<>(requestBody, headers);
+
+        try {
+
+            ResponseEntity<String> response =
+                    restTemplate.exchange(url, HttpMethod.POST, request, String.class);
+
+            ObjectMapper mapper = new ObjectMapper();
+
+            // ✅ Parse JSON response
+            Map<String, Object> body =
+                    mapper.readValue(response.getBody(), Map.class);
+
+            List<Map<String, Object>> candidates =
+                    (List<Map<String, Object>>) body.get("candidates");
+
+            Map<String, Object> firstCandidate = candidates.get(0);
+
+            Map<String, Object> contentMap =
+                    (Map<String, Object>) firstCandidate.get("content");
+
+            List<Map<String, Object>> parts =
+                    (List<Map<String, Object>>) contentMap.get("parts");
+
+            Map<String, Object> firstPart = parts.get(0);
+
+            String summary = (String) firstPart.get("text");
+
+            return summary;   // ✅ RETURN CLEAN SUMMARY ONLY
+
+        } catch (Exception e) {
+            throw new RuntimeException("Gemini API Error: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public OrderResponse verifyPayment(PaymentVerificationRequest request) {
+        // Find existing order
+        OrderEntity existingOrder= orderEntityRepository.findByOrderId(request.getOrderId())
+                .orElseThrow(()-> new RuntimeException("Order not found"));
+
+        if(!verifyRazorpaySignature(request.getRazorPayOrderId(),request.getRazorpayPaymentId(),request.getRazorpaySignature())){
+            throw new RuntimeException("Payment verification failed");
+        }
+
+        // Update payment details
+        PaymentDetails paymentDetails=existingOrder.getPaymentDetails();
+        paymentDetails.setRazorpayOrderId(request.getRazorPayOrderId());
+        paymentDetails.setRazorpayPaymentId(request.getRazorpayPaymentId());
+        paymentDetails.setRazorpaySignature(request.getRazorpaySignature());
+        paymentDetails.setStatus(PaymentDetails.PaymentStatus.COMPLETED);
+        // Save updated order
+        existingOrder=orderEntityRepository.save(existingOrder);
+        // Convert to response
+        return convertToResponse(existingOrder);
+    }
+
+    @Override
+    public Double sumSalesByDate(LocalDate date) {
+        return orderEntityRepository.sumSalesByDate(date);
+    }
+
+    @Override
+    public Long countByOrderDate(LocalDate date) {
+        return orderEntityRepository.countByOrderDate(date);
+    }
+
+    @Override
+    public Page<OrderResponse> getOrders(Pageable pageable, String searchValue) {
+        Specification<OrderEntity> specs= OrderSpecification.Search(searchValue);
+        return orderEntityRepository.findAll(specs , pageable).map(this::convertToResponse);
+    }
+
+    @Override
+    public List<OrderResponse> findRecentOrders() {
+       return orderEntityRepository.findAll(PageRequest.of(0,5))
+                .stream()
+                .map(orderEntity -> convertToResponse(orderEntity))
+                .collect(Collectors.toList());
+    }
+
+
+    private boolean verifyRazorpaySignature(String razorPayOrderId, String razorPayOrderId1, String razorpaySignature) {
+        return true;
+    }
+}
